@@ -74,6 +74,7 @@ spec:
                 [ -f "$f" ] && . "$f"
               done
               set +a
+              echo "[vault-secrets] loaded env keys: $(env | grep -E '^(DB_|REDIS_|MONGO_|JWT_)' | cut -d= -f1 | sort | tr '\n' ' ')"
               exec nginx -g 'daemon off;'
           {{- end }}
           ports:
