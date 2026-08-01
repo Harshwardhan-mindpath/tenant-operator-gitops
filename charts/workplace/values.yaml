@@ -27,3 +27,14 @@ storage:
   size: 1Gi
 ingress:
   enabled: false
+
+# Vault Agent Injector: pulls this tenant's secrets (written by
+# vault_service.write_initial_tenant_secrets(), see
+# secret/tenants/{{ tenant.id }}/{redis,database,mongo,jwt}) into the pod at
+# startup. Uses the "tenant-workload" Kubernetes auth role, bound to the
+# "default" ServiceAccount in any namespace -- fine for this POC since every
+# tenant namespace uses the default SA; a real deployment would want a
+# dedicated ServiceAccount per tenant instead.
+vault:
+  enabled: true
+  role: tenant-workload
