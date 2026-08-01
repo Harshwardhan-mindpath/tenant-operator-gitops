@@ -69,9 +69,11 @@ spec:
           args:
             - |
               set -e
+              set -a
               for f in /vault/secrets/*; do
                 [ -f "$f" ] && . "$f"
               done
+              set +a
               exec nginx -g 'daemon off;'
           {{- end }}
           ports:
