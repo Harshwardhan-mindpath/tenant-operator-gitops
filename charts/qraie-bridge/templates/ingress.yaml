@@ -1,0 +1,37 @@
+{{- $root := . }}
+{{- $hasIngress := false }}
+{{- range .Values.services }}
+{{- if and (not (eq .enabled false)) (default (dict) .ingress).enabled }}
+{{- $hasIngress = true }}
+{{- end }}
+{{- end }}
+{{- if $hasIngress }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "qraie-bridge.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "qraie-bridge.labels" . | nindent 4 }}
+  {{- with .Values.global.ingressAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  ingressClassName: {{ .Values.global.ingressClassName }}
+  rules:
+    - host: {{ .Values.global.domain }}
+      http:
+        paths:
+          {{- range $svc := .Values.services }}
+          {{- if and (not (eq $svc.enabled false)) (default (dict) $svc.ingress).enabled }}
+          - path: {{ $svc.ingress.path }}
+            pathType: {{ default "Prefix" $svc.ingress.pathType }}
+            backend:
+              service:
+                name: {{ $svc.name }}
+                port:
+                  number: {{ $svc.port }}
+          {{- end }}
+          {{- end }}
+{{- end }}

@@ -1,0 +1,6 @@
+apiVersion: v2
+name: qraie-bridge
+description: Per-tenant "bridge" application stack (converted from the prototype-bridge docker-compose), deployed by Argo CD via tenant-operator's GitOps flow
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

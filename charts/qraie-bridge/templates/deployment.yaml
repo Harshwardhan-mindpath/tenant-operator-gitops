@@ -1,0 +1,133 @@
+{{- $root := . }}
+{{- range $svc := .Values.services }}
+{{- if not (eq $svc.enabled false) }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "qraie-bridge.fullname" $root }}-{{ $svc.name }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "qraie-bridge.labels" $root | nindent 4 }}
+    {{- include "qraie-bridge.serviceSelectorLabels" (dict "root" $root "svc" $svc) | nindent 4 }}
+spec:
+  replicas: {{ default 1 $svc.replicas }}
+  selector:
+    matchLabels:
+      {{- include "qraie-bridge.serviceSelectorLabels" (dict "root" $root "svc" $svc) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "qraie-bridge.serviceSelectorLabels" (dict "root" $root "svc" $svc) | nindent 8 }}
+      annotations:
+        {{- if (default (dict) $svc.vault).enabled }}
+        # Vault Agent Injector -- same mechanism as poc/chart-workplace and
+        # the tenant-operator itself. This service had /vault/secrets
+        # mounted in the source compose file; the rendered secret files
+        # land under /vault/secrets/ same as before, this app is expected
+        # to read them from there directly (that's what the read-only
+        # mount in the compose file was already doing).
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: {{ $root.Values.global.vault.role | quote }}
+        {{- end }}
+    spec:
+      {{- with $root.Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $svc.dnsConfig }}
+      # dnsPolicy defaults to ClusterFirst -- these extra nameservers are
+      # appended to it, not a replacement, so in-cluster Service names
+      # (e.g. bridge-cp-redis, qraie-redis) still resolve normally. The
+      # source compose file's `dns:` block was additive in the same way.
+      dnsConfig:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ $svc.name }}
+          image: "{{ $svc.image.repository }}:{{ $svc.image.tag }}"
+          {{- with $svc.command }}
+          command:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $svc.args }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if gt (int (default 0 $svc.port)) 0 }}
+          ports:
+            - containerPort: {{ $svc.port }}
+          {{- end }}
+          env:
+            {{- include "qraie-bridge.env" (dict "root" $root "svc" $svc) | nindent 12 }}
+          {{- if or $svc.persistentVolumeMounts $svc.extraVolumeMounts (and (eq $svc.name "radicale") $root.Values.radicale.configConfigMapName) }}
+          volumeMounts:
+            {{- range $svc.persistentVolumeMounts }}
+            - name: {{ .name | kebabcase }}
+              mountPath: {{ .mountPath }}
+              {{- with .subPath }}
+              subPath: {{ . }}
+              {{- end }}
+            {{- end }}
+            {{- with $svc.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+            {{- if eq $svc.name "radicale" }}
+            {{- if $root.Values.radicale.configConfigMapName }}
+            - name: radicale-config
+              mountPath: /config/config
+              readOnly: true
+            {{- end }}
+            {{- if $root.Values.radicale.rightsConfigMapName }}
+            - name: radicale-rights
+              mountPath: /config/rights
+              readOnly: true
+            {{- end }}
+            {{- end }}
+          {{- end }}
+          {{- if $svc.healthCheck }}
+          readinessProbe:
+            httpGet:
+              path: {{ $svc.healthCheck.path }}
+              port: {{ $svc.healthCheck.port }}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: {{ $svc.healthCheck.path }}
+              port: {{ $svc.healthCheck.port }}
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          {{- end }}
+          resources:
+            {{- toYaml (default $root.Values.global.defaultResources $svc.resources) | nindent 12 }}
+      {{- $needsVolumes := or $svc.persistentVolumeMounts $svc.extraVolumes (and (eq $svc.name "radicale") (or $root.Values.radicale.configConfigMapName $root.Values.radicale.rightsConfigMapName)) }}
+      {{- if $needsVolumes }}
+      volumes:
+        {{- $pvNames := list }}
+        {{- range $svc.persistentVolumeMounts }}
+        {{- $pvNames = append $pvNames (.name | kebabcase) }}
+        {{- end }}
+        {{- range ($pvNames | uniq) }}
+        - name: {{ . }}
+          persistentVolumeClaim:
+            claimName: {{ include "qraie-bridge.fullname" $root }}-{{ . }}
+        {{- end }}
+        {{- with $svc.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- if eq $svc.name "radicale" }}
+        {{- if $root.Values.radicale.configConfigMapName }}
+        - name: radicale-config
+          configMap:
+            name: {{ $root.Values.radicale.configConfigMapName }}
+        {{- end }}
+        {{- if $root.Values.radicale.rightsConfigMapName }}
+        - name: radicale-rights
+          configMap:
+            name: {{ $root.Values.radicale.rightsConfigMapName }}
+        {{- end }}
+        {{- end }}
+      {{- end }}
+{{- end }}
+{{- end }}

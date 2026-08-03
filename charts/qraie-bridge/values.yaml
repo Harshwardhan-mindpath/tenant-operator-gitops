@@ -1,0 +1,609 @@
+# Converted from prototype-bridge's docker-compose.yml. One logical service
+# per compose entry -- "_blue"/"_green" pairs were collapsed to a single
+# Deployment each (per-service `image.tag` is now just a value to change;
+# Kubernetes rolling updates replace the manual blue/green swap). See this
+# chart's README.md for the full list of TODOs/conflicts this conversion
+# surfaced that need your review before a real rollout.
+
+global:
+  # Was `tenant.id`/`TENANT_ID` throughout the compose file.
+  tenantId: PROTOTYPE
+  # Was VIRTUAL_HOST (every service in the compose file shares this one
+  # host) -- becomes the single Ingress's host, path-routed per service
+  # below via each service's `ingress.path` (was VIRTUAL_PATH).
+  domain: prototype-bridgestg.qraie.ai
+  ingressClassName: nginx
+  ingressAnnotations: {}
+  imagePullSecrets: []
+
+  # Was the `x-common-env-variables` YAML anchor, merged into every service
+  # that had `<<: *common-env-variables` in its `environment:` block --
+  # same merge behavior here: a service's own `env` overrides these on key
+  # conflicts. Services that did NOT use the anchor set `useCommonEnv: false`.
+  commonEnv:
+    REDIS_HOST: "192.168.85.91"
+    REDIS_PORT: "30168"
+    REDIS_PASSWORD: "Hbs52o2oR-STG"
+    GLOBALAPIBASEURL: "http://192.168.85.194:1038"
+    ACTIVE_COLOR: ""
+    START_PORT: "30166"
+
+  # Vault Agent Injector -- same mechanism already wired for the tenant
+  # nginx chart (poc/chart-workplace) and the tenant-operator itself. Only
+  # services below that had `/vault/secrets:/vault/secrets:ro` in the
+  # compose file set `vault.enabled: true` on themselves; this just holds
+  # the shared role name.
+  vault:
+    role: tenant-workload
+
+  # Applied to every Deployment unless a service overrides `resources:`.
+  defaultResources:
+    requests:
+      cpu: "50m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+
+# --- Persistent volumes -----------------------------------------------------
+# Named PVCs referenced by services below via `persistentVolumeMounts`.
+# Sizes are starting points -- tune per tenant. Anything that was a host
+# bind-mount of *static, pre-populated* content in the compose file (config
+# files, not writable data dirs) can't be turned into a PVC by this chart --
+# see `radicale.configConfigMapName`/`rightsConfigMapName` below and the
+# README's TODO list for the ones this applies to.
+persistence:
+  bridgeCpSrInstances: { size: 1Gi }   # was the `bridge-cp-wtl-sr-instances` named volume
+  bridgeCpRedisData: { size: 1Gi }     # was the `redis-data` named volume
+  voxflowAgents: { size: 256Mi }        # was the `voxflow_agents` named volume
+  voxflowMcp: { size: 256Mi }           # was the `voxflow_mcp` named volume
+  erepGenerated: { size: 1Gi }          # was erep-server's ./generated-ereps bind mount
+  erepLogs: { size: 512Mi }             # was erep-server's ./logs bind mount
+  gatewayAttachments: { size: 1Gi }     # was the shared ./attachments/./attachment/./uploads bind mounts
+  prismVideos: { size: 5Gi }            # was prism-backend's /data/prism-videos bind mount
+  radicaleData: { size: 512Mi }         # was radicale's ./radicale/data bind mount
+  enrollmentDeepface: { size: 2Gi }     # was enrollment-api's /hbss/iot-vlm/deepface bind mount
+  enrollmentDb: { size: 1Gi }           # was enrollment-api's /hbss/iot-vlm/db bind mount
+
+# Radicale's config/rights are static files the *compose host* had checked
+# out at ./radicale/config and ./radicale/rights -- this chart has no way to
+# know their contents. Create them yourself and point at them here, e.g.:
+#   kubectl create configmap radicale-config --from-file=./radicale/config -n <tenant-ns>
+#   kubectl create configmap radicale-rights --from-file=./radicale/rights -n <tenant-ns>
+radicale:
+  configConfigMapName: ""
+  rightsConfigMapName: ""
+
+# --- Services ----------------------------------------------------------------
+# One entry per logical service. See README.md for the full schema and for
+# every TODO/ambiguity this conversion surfaced (the /var/run/docker.sock
+# mounts that were deliberately dropped, the dangling PRISM_BASE_URL
+# reference to a service that doesn't exist in the compose file, and the
+# three services that all implicitly claimed the Ingress's "/" path).
+services:
+  # --- Redis instances ---
+  - name: qraie-redis-blue
+    image: { repository: redis, tag: "7" }
+    command: ["redis-server", "--requirepass", "Hbs52o2oR-STG"]
+    port: 6379
+    useCommonEnv: false
+
+  - name: qraie-redis
+    image: { repository: redislabs/redisgears, tag: "1.2.5" }
+    port: 6379
+    useCommonEnv: false
+    dnsConfig:
+      nameservers: ["8.8.8.8", "8.8.4.4"]
+
+  - name: bridge-cp-redis
+    image: { repository: iad.ocir.io/hbssoc/bridge-cp-redis, tag: stg }
+    port: 6379
+    useCommonEnv: false
+    dnsConfig:
+      nameservers: ["8.8.8.8", "8.8.4.4"]
+    persistentVolumeMounts:
+      - name: bridgeCpSrInstances
+        mountPath: /opt/bridge-cp-wtl/sr-instances
+      - name: bridgeCpRedisData
+        mountPath: /data
+    # TODO: compose also bind-mounted the host path
+    # /opt/bridge-cp-redis/dispatcher here -- static content that lived on
+    # the docker-compose VM, no portable Kubernetes equivalent. Bring your
+    # own ConfigMap/PVC and add it via extraVolumes/extraVolumeMounts below
+    # if this service actually needs it at runtime.
+    extraVolumes: []
+    extraVolumeMounts: []
+
+  # --- Bridge control plane ---
+  - name: bridge-cp-conductor
+    image: { repository: iad.ocir.io/hbssoc/bridge-cp-conductor, tag: prototype }
+    port: 8461
+    useCommonEnv: false
+    ingress:
+      enabled: true
+      path: /controlopsv2/api/
+    vault:
+      enabled: true
+    env:
+      API_PORT: "8461"
+      REDIS_HOST: bridge-cp-redis   # was the container name, now the Service name
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: "Hbs52o2oR-STG"
+      REDIS_CONTAINER: bridge-cp-redis
+      REDIS_DISPATCHER_PATH: /opt/bridge-cp-redis/dispatcher/master_dispatcher.py
+      SR_BASE_PATH: /opt/bridge-cp-wtl/sr-instances
+      SR_NAME: bridge-cp-PROTOTYPE-sr
+      GEMINI_MODEL: gemini-3-flash-preview
+      WORKPLACE_DM_SOCKET_URL: "https://prototype-bridgestg.qraie.ai"
+      WORKPLACE_DM_CLIENT_ID: QraieBot
+      WORKPLACE_DM_PASSWORD: '$2b$10$CYXVMyolsdZFu/XjgwuhS.5zCNk3WW64j5AJVy8sKs0.bIKEEKctm'
+      NOTIF_ENG_BASE_URL: https://staging-notif-eng.qryde.net
+    persistentVolumeMounts:
+      - name: bridgeCpSrInstances
+        mountPath: /opt/bridge-cp-wtl/sr-instances
+    # TODO: compose also mounted /var/run/docker.sock here (this container
+    # spun up sibling Docker containers directly) and the same
+    # /opt/bridge-cp-redis/dispatcher host path as bridge-cp-redis above.
+    # Deliberately NOT carried over -- see README.md "Docker socket" section.
+    # Whatever this used docker.sock for needs a real redesign (Kubernetes
+    # Jobs API + scoped RBAC instead of mounting the host's Docker socket,
+    # which is equivalent to granting root on the node).
+    extraVolumes: []
+    extraVolumeMounts: []
+
+  - name: bridge
+    image: { repository: iad.ocir.io/hbssoc/acetaxi-bridge, tag: prototype }
+    port: 30170
+    ingress:
+      enabled: true
+      path: /
+      # NOTE: `iot-broker-web` and `radicale` below also implicitly claim
+      # "/" for this same host -- the source compose file has THREE
+      # services all wanting the Ingress default path. See README.md, this
+      # needs your decision before going live; only one of these three
+      # `ingress.path: /` entries should stay "/" and it should probably be
+      # `pathType: ImplementationSpecific` with the others' explicit paths
+      # taking priority (nginx-ingress does path-length-based precedence,
+      # but relying on that implicitly is exactly what bit the original
+      # nginx-proxy setup too).
+    vault:
+      enabled: true
+    env:
+      PORT: "30170"
+      NODE_ENV: production
+      GEMINI_MODEL: gemini-3.1-pro-preview
+
+  # --- Control ops ---
+  - name: controlops-server
+    image: { repository: iad.ocir.io/hbssoc/controlops_server, tag: prototype }
+    port: 30172
+    useCommonEnv: false
+    ingress:
+      enabled: true
+      path: /controlops/api/
+    env:
+      REDIS_HOST: qraie-redis   # was container name "qraie-redis-prototype"
+      REDIS_PORT: "6379"
+      GLOBALAPIBASEURL: https://qraie_ai-b.qryde.net
+      API_PORT: "30172"
+      DB_HOST: "192.168.85.91"
+      DB_USER: sa
+      # NOTE: plaintext in the source compose file -- move to `vault:
+      # enabled: true` (Vault Agent) or an existingSecretName-style
+      # mechanism before any real deployment. Kept as-is here for parity.
+      DB_PASSWORD: nighT0w1
+      DB_NAME: prototype
+      MONGODB_URI: "mongodb://mongo:mongo@192.168.85.194:27092/finalproj?authSource=admin"
+
+  # --- Erep server ---
+  - name: erep-server
+    image: { repository: iad.ocir.io/hbssoc/erep-server, tag: stg }
+    port: 30174
+    ingress:
+      enabled: true
+      path: /galaxy/erepapi/
+    env:
+      NODE_ENV: production
+      BASE_URL: https://qraie_ai-b.qryde.net
+      MONGODB_URI: ""   # blank in the source compose file too
+      GLOBALAPIBASEURL: https://qraie_ai-b.qryde.net
+      # DOCKER_ENABLED signaled this service's own /var/run/docker.sock use
+      # in the source -- kept for parity/documentation, but see the TODO
+      # below: the socket mount itself was deliberately dropped.
+      DOCKER_ENABLED: "true"
+      LOG_LEVEL: info
+    persistentVolumeMounts:
+      - name: erepGenerated
+        mountPath: /app/generated-ereps
+      - name: erepLogs
+        mountPath: /app/logs
+    # TODO: compose also mounted /var/run/docker.sock here -- deliberately
+    # NOT carried over, same reasoning as bridge-cp-conductor above.
+
+  # --- Qraie API gateway + microservice ---
+  - name: qraie-api-gateway
+    image: { repository: iad.ocir.io/hbssoc/qraie-api-gateway-v4-stg, tag: prototype }
+    port: 30176
+    ingress:
+      enabled: true
+      path: /workplace/api/
+    env:
+    # was three separate bind mounts (./attachments/, ./attachment/,
+    # ./Jira_Revamp_MicroSevice/uploads/) -- consolidated onto one shared
+    # PVC via subPaths since none of them held pre-populated content.
+    persistentVolumeMounts:
+      - name: gatewayAttachments
+        mountPath: /src/attachment
+        subPath: attachments
+      - name: gatewayAttachments
+        mountPath: /src/app/attachment
+        subPath: attachment
+      - name: gatewayAttachments
+        mountPath: /src/app/uploads
+        subPath: uploads
+
+  - name: microservice-qraie
+    image: { repository: iad.ocir.io/hbssoc/qraiebot-microservice-v4-stg, tag: prototype }
+    # No VIRTUAL_HOST in the source -- internal only, reached by
+    # qraie-api-gateway/others via the Service name.
+    port: 0
+    env:
+    persistentVolumeMounts:
+      - name: gatewayAttachments
+        mountPath: /src/attachment
+        subPath: attachments
+      - name: gatewayAttachments
+        mountPath: /src/app/uploads
+        subPath: uploads
+
+  # --- Qraie UI / admin panel ---
+  - name: qraie-ui
+    image: { repository: iad.ocir.io/hbssoc/qraie-ui-hbss-v4-stg, tag: prototype }
+    port: 30180
+    ingress:
+      enabled: true
+      path: /workplace/
+
+  - name: admin-panel
+    image: { repository: iad.ocir.io/hbssoc/qraie-admin-panel, tag: bridge }
+    port: 30182
+    ingress:
+      enabled: true
+      path: /workplace/admin-portal/
+    env:
+      NODE_ENV: development
+      NEXT_PUBLIC_VERSION: "1.0.1"
+
+  # --- WFM ---
+  - name: wfm-api-gateway
+    image: { repository: iad.ocir.io/hbssoc/fabreq_gateway, tag: prototype }
+    port: 30184
+    ingress:
+      enabled: true
+      path: /organization/wfm/api/
+    env:
+      SERVER_PORT: "30184"
+      SERVER_HOST: "0.0.0.0"
+      NODE_ENV: development
+      SERVER_NAME: wfm-gateway
+      FABREQ_COMMAND_ENDPOINT_MAP: "http://wfm-microservice:9001"
+      ALLOWED_ORIGINS: "*"
+      LOG_LEVEL: debug
+      TZ: America/New_York
+
+  - name: wfm-ui
+    image: { repository: iad.ocir.io/hbssoc/wfm-ui, tag: prototype }
+    port: 30188
+    ingress:
+      enabled: true
+      path: /organization/wfm/
+    env:
+      SERVER_HOST: "0.0.0.0"
+      NODE_ENV: development
+      NEXT_PUBLIC_SOCKET_URL: "https://prototype-bridgestg.qraie.ai/organization/wfm/api/"
+      NEXT_PUBLIC_VERSION: "1.0.1"
+      TZ: America/New_York
+
+  - name: wfm-microservice
+    image: { repository: iad.ocir.io/hbssoc/fabreq-microservice, tag: prototype }
+    port: 9001   # no ingress -- reached only via wfm-api-gateway's FABREQ_COMMAND_ENDPOINT_MAP (Service DNS)
+    env:
+      SERVER_PORT: "9001"
+      SERVER_HOST: "0.0.0.0"
+      NODE_ENV: development
+      MICROSERVICE_NAME: wfm-microservice
+      TENANT_KEY: wfm
+      TENANT_IDS: prototype
+      CONFIG_API_URL: "https://qraie_ai-b.qryde.net/config/dbconnstr"
+      JWT_SECRETS_MAP: '{ "wfm": "MmdBz4qgZzqhoZxBn8gyN3ErO9kFthCl" }'
+      GLOBAL_CONN_POOL_CONFIG: '{"enableStatistics": true, "queueTimeout": 240000, "poolIncrement": 2}'
+      TZ: America/New_York
+
+  # --- MCP ---
+  - name: mcp-server
+    image: { repository: iad.ocir.io/hbssoc/mcp_server, tag: prototype }
+    port: 10011   # no ingress -- reached only via mcp-client's MCP_SERVER_URL (Service DNS)
+    env:
+      PORT: "10011"
+      MCP_SERVER_PORT: "10011"
+      TZ: America/New_York
+    healthCheck:
+      path: /health
+      port: 10011
+
+  - name: mcp-client
+    image: { repository: iad.ocir.io/hbssoc/mcp_client, tag: prototype }
+    port: 30192
+    ingress:
+      enabled: true
+      path: /galaxy/slmapi/
+    env:
+      MCP_SERVER_URL: "http://mcp-server:10011/mcp"
+      CONF_URL: "https://qraie_ai-b.qryde.net/config/dbconnstr"
+      TZ: America/New_York
+
+  # --- Tranops ---
+  - name: tranops-ui
+    image: { repository: iad.ocir.io/hbssoc/tranops-ui, tag: prototype }
+    port: 30194
+    ingress:
+      enabled: true
+      path: /tranops
+    env:
+      BASE_URL: /tranops
+      VITE_API_URL: "https://prototype-bridgestg.qraie.ai/tranops/api"
+      VITE_WS_URL: "https://prototype-bridgestg.qraie.ai/"
+
+  - name: tranops-backend
+    image: { repository: iad.ocir.io/hbssoc/tranops-backend, tag: prototype }
+    port: 30196
+    ingress:
+      enabled: true
+      path: /tranops/api
+    env:
+      SLM_API_URL: https://slm-kb.qraie.ai
+      SLM_USERNAME: bridgeUser
+      # NOTE: plaintext in the source compose file, same recommendation as
+      # controlops-server's DB_PASSWORD above.
+      SLM_PASSWORD: "bridgeUser@123"
+      MONGODB_URI: "mongodb://mongo:mongo@192.168.85.194:27092/tranops?authSource=admin"
+      JWT_SECRET: "9f3c6d8a4e1b7f2d9c5a8e6b4d1f0a7c3e9b2f8d6a4c1e5b7d0f9a2c8e6"
+      JWT_EXPIRES_IN: 24h
+      API_PORT: "30196"
+      ELEVENLABS_API_KEY: "sk_***"
+      ELEVENLABS_API_URL: https://api.elevenlabs.io
+      AGENTS_API_URL: "https://prototype-bridgestg.qraie.ai"
+      POLLING_INTERVAL_MS: "30000"
+      MCP_SERVER_URL: https://mcp-slm-client.qryde.net/get_conversations
+
+  # --- IoT broker ---
+  - name: iot-broker-data
+    image: { repository: iad.ocir.io/hbssoc/iot-broker-data-service, tag: stg }
+    port: 3001
+    useCommonEnv: false
+    ingress:
+      enabled: true
+      path: /iot-broker/api/data/
+    env:
+      NODE_ENV: production
+      PORT: "3001"
+      MONGODB_URI: "mongodb://mongo:mongo@192.168.85.194:27092/"
+      IOT_VLM_BASE_URL: "https://prototype-bridgestg.qraie.ai/enrollment"
+      BROKER_SERVICE_URL: "http://iot-broker-broker:3003"
+      # Were `${VAR:-default}` compose substitutions -- now plain values,
+      # fill in real ones per tenant.
+      LOCONAV_WEBHOOK_SECRET: ""
+      LOCONAV_WEBHOOK_SECRETS: ""
+      LOCONAV_WEBHOOK_AUTO_CREATE_DEVICE: "false"
+      LOCONAV_WEBHOOK_ALLOW_INSECURE: "false"
+
+  - name: iot-broker-config
+    image: { repository: iad.ocir.io/hbssoc/iot-broker-config-service, tag: stg }
+    port: 3002
+    useCommonEnv: false
+    ingress:
+      enabled: true
+      path: /iot-broker/api/config/
+    env:
+      NODE_ENV: production
+      PORT: "3002"
+      MONGODB_URI: "mongodb://mongo:mongo@192.168.85.194:27092/"
+
+  - name: iot-broker-broker
+    image: { repository: iad.ocir.io/hbssoc/iot-broker-broker-service, tag: stg }
+    port: 3003
+    useCommonEnv: false
+    ingress:
+      enabled: true
+      path: /iot-broker/
+    env:
+      NODE_ENV: production
+      PORT: "3003"
+      LOG_LEVEL: debug
+      DATA_SERVICE_URL: "http://iot-broker-data:3001"
+      CONFIG_SERVICE_URL: "http://iot-broker-config:3002"
+      WEB_PORTAL_URL: "http://iot-broker-web:80"
+      SOCKET_IO_PATH: /socket.io
+      FRONTEND_URL: "*"
+
+  - name: iot-broker-admin
+    image: { repository: iad.ocir.io/hbssoc/iot-broker-admin-panel, tag: stg }
+    port: 80
+    useCommonEnv: false
+    ingress:
+      enabled: true
+      path: /iot-broker/admin/
+    env:
+      FRONTEND_URL: "https://prototype-bridgestg.qraie.ai"
+      BASE_URL: "https://prototype-bridgestg.qraie.ai"
+      PUBLIC_URL: "https://prototype-bridgestg.qraie.ai"
+
+  - name: iot-broker-web
+    image: { repository: iad.ocir.io/hbssoc/iot-broker-web-portal, tag: stg }
+    port: 80
+    useCommonEnv: false
+    ingress:
+      enabled: true
+      path: /   # see the "/" conflict note on the `bridge` service above
+    env:
+      FRONTEND_URL: "https://prototype-bridgestg.qraie.ai"
+      BASE_URL: "https://prototype-bridgestg.qraie.ai"
+      PUBLIC_URL: "https://prototype-bridgestg.qraie.ai"
+      VITE_BASE_PATH: /iot-broker/
+      VITE_DATA_SERVICE_URL: "https://prototype-bridgestg.qraie.ai/iot-broker/api/data"
+      VITE_SOCKET_URL: "https://prototype-bridgestg.qraie.ai"
+      VITE_SOCKET_IO_PATH: /iot-broker/socket.io
+      VITE_WEB_PORTAL_URL: "https://prototype-bridgestg.qraie.ai/iot-broker/"
+
+  - name: iot-broker-loconav-vision
+    image: { repository: iad.ocir.io/hbssoc/iot-broker-loconav-vision-gateway, tag: stg }
+    port: 3040
+    useCommonEnv: false
+    ingress:
+      enabled: true
+      path: /vision
+    env:
+      NODE_ENV: production
+      PORT: "3040"
+      DATA_SERVICE_URL: "http://iot-broker-data:3001"
+      FRONTEND_URL: "*"
+
+  - name: enrollment-api
+    image: { repository: iad.ocir.io/hbssoc/iot-vlm, tag: stg }
+    port: 3003
+    useCommonEnv: false
+    ingress:
+      enabled: true
+      path: /enrollment/
+    env:
+      SML_BASE_URL: https://qraie-demo.qryde.net
+      REDIS_URL: "redis://qraie-redis:6379"
+      IOT_BROKER_URL: "https://prototype-bridgestg.qraie.ai/iot-broker/"
+    persistentVolumeMounts:
+      - name: enrollmentDeepface
+        mountPath: /root/.deepface
+      - name: enrollmentDb
+        mountPath: /app/db
+    healthCheck:
+      path: /
+      port: 3003
+
+  # --- ACL / Prism / Voxflow / Scheduler / Radicale ---
+  - name: acl-server
+    image: { repository: iad.ocir.io/hbssoc/acl-server, tag: stg }
+    port: 28077
+    ingress:
+      enabled: true
+      path: /acl_server/api
+    env:
+      PORT: "28077"
+
+  - name: prism-ui
+    image: { repository: iad.ocir.io/hbssoc/prism-ui, tag: stg }
+    port: 28080
+    ingress:
+      enabled: true
+      path: /prism-ui
+    env:
+      PORT: "28080"
+      VITE_API_URL: "https://prototype-bridgestg.qraie.ai/prism/api"
+
+  - name: prism-backend
+    image: { repository: iad.ocir.io/hbssoc/prism-backend, tag: stg }
+    port: 28078
+    ingress:
+      enabled: true
+      path: /prism/api
+    vault:
+      enabled: true
+    env:
+      PORT: "28078"
+      VIDEOS_DIR: /data/prism-videos
+    persistentVolumeMounts:
+      - name: prismVideos
+        mountPath: /data/prism-videos
+
+  - name: prism-scanner
+    image: { repository: iad.ocir.io/hbssoc/prism-scanner, tag: stg }
+    port: 28079
+    ingress:
+      enabled: true
+      path: /prism-scanner
+    env:
+      PORT: "28079"
+      VITE_API_URL: "https://prototype-bridgestg.qraie.ai/prism/api"
+
+  - name: voxflow
+    image: { repository: iad.ocir.io/hbssoc/voxflow, tag: stg }
+    port: 30524
+    ingress:
+      enabled: true
+      path: /voxflow
+    vault:
+      enabled: true
+    env:
+      BASE_PATH: /voxflow
+      RIDE_API_AUTH_TOKEN: ""   # blank in the source compose file -- likely meant to come from Vault
+      PORT: "30524"
+    persistentVolumeMounts:
+      - name: voxflowAgents
+        mountPath: /app/agents
+      - name: voxflowMcp
+        mountPath: /app/mcp
+    healthCheck:
+      path: /health
+      port: 30524
+
+  - name: scheduler-agent
+    image: { repository: iad.ocir.io/hbssoc/schedular-agent, tag: stg }
+    port: 4200
+    ingress:
+      enabled: true
+      path: /scheduler-agent/api
+    vault:
+      enabled: true
+    env:
+      PORT: "4200"
+      RADICALE_BASE_URL: "http://radicale:5232"
+      RADICALE_AGENT_USER: scheduler-agent
+      # NOTE: plaintext in the source compose file -- candidate for Vault
+      # alongside the other secret-shaped fields already flagged above.
+      RADICALE_AGENT_PASS: M5bGiJ1mQ0
+      SESSION_TTL_MINUTES: "30"
+      CONDUCTOR_BASE_URL: "http://bridge-cp-conductor:8461"
+      CONDUCTOR_API_KEY: ""   # blank in the source compose file
+      # NOTE: the source compose file points this at "http://event-manager:4000",
+      # but no "event-manager" service exists anywhere in the compose file --
+      # a dangling reference. Pointed at prism-backend here as the most
+      # likely intended target (same PRISM_* naming) -- please confirm.
+      PRISM_BASE_URL: "http://prism-backend:28078"
+      PRISM_POLL_INTERVAL_MS: "30000"
+      PRISM_BRIDGE_ENABLED: "1"
+      GLOBALAPIBASEURL: https://qraie_ai-b.qryde.net
+      CORS_ORIGINS: "http://localhost:3000,http://localhost:8461"
+      MEETING_API_URL: https://qr-avbe.hbssweb.com/room
+      # NOTE: plaintext in the source compose file.
+      MEETING_API_KEY: AG.L5hxsKpbfd7S0MulvH6ZIAGqx6GUPsVK
+      MEETING_JOIN_BASE_URL: https://qr-video.hbssweb.com/call
+
+  - name: radicale
+    image: { repository: tomsquest/docker-radicale, tag: 3.3.3.0 }
+    port: 5232
+    useCommonEnv: false
+    ingress:
+      enabled: true
+      path: /   # see the "/" conflict note on the `bridge` service above --
+                # this is the THIRD service implicitly claiming the root path
+    vault:
+      enabled: true
+    env:
+      RADICALE_CONFIG: /config/config
+    persistentVolumeMounts:
+      - name: radicaleData
+        mountPath: /data
+    # config/rights are bring-your-own ConfigMaps -- see `radicale.*` at the
+    # top of this file. Wired in templates/deployment.yaml directly (not a
+    # generic extraVolumes entry) since they're specific to this one service.
+    healthCheck:
+      path: /
+      port: 5232

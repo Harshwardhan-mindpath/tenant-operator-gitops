@@ -1,0 +1,23 @@
+{{- $root := . }}
+{{- range $svc := .Values.services }}
+{{- if and (not (eq $svc.enabled false)) (gt (int (default 0 $svc.port)) 0) }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  # Name matches the compose container/service name exactly -- every
+  # inter-service env var above (REDIS_HOST, BROKER_SERVICE_URL,
+  # MCP_SERVER_URL, etc.) already assumes this as the Service DNS name.
+  name: {{ $svc.name }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "qraie-bridge.labels" $root | nindent 4 }}
+    {{- include "qraie-bridge.serviceSelectorLabels" (dict "root" $root "svc" $svc) | nindent 4 }}
+spec:
+  selector:
+    {{- include "qraie-bridge.serviceSelectorLabels" (dict "root" $root "svc" $svc) | nindent 4 }}
+  ports:
+    - port: {{ $svc.port }}
+      targetPort: {{ $svc.port }}
+{{- end }}
+{{- end }}

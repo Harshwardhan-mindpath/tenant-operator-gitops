@@ -1,0 +1,19 @@
+{{- $root := . }}
+{{- range $key, $pv := .Values.persistence }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "qraie-bridge.fullname" $root }}-{{ $key | kebabcase }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "qraie-bridge.labels" $root | nindent 4 }}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- with $pv.storageClassName }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ $pv.size }}
+{{- end }}
