@@ -29,15 +29,58 @@ code change, not something this chart can paper over. Both services still
 have their `DOCKER_ENABLED`/related env vars for parity, but the actual
 capability is gone until you make that change.
 
-**Three services all implicitly claim the Ingress's `/` path**: `bridge`
-(no `VIRTUAL_PATH` in the source, defaults to root), `iot-broker-web` (same),
-and `radicale` (`VIRTUAL_PATH` was commented out). The original
-`nginx-proxy`-based compose setup had the exact same ambiguity — whichever
-one "won" depended on registration order, not something explicit. This chart
-renders all three, unmodified, so the conflict is visible (`kubectl get
-ingress -o yaml` will show three `path: /` rules for one host) rather than
-silently resolved by me guessing. Pick the one that should actually own `/`
-and change the other two's `services[].ingress.path` before a real rollout.
+**Ingress routing was rebuilt from the real `nginx.conf`, not guessed from
+compose env vars.** The compose file's `VIRTUAL_HOST`/`VIRTUAL_PATH` env vars
+(read by `nginx-proxy`, the auto-config-generator sidecar the original VM
+setup used) made it look like ~26 services were externally exposed,
+including three all implicitly claiming `/` (`bridge`, `iot-broker-web`,
+`radicale`). Once the actual `nginx.conf` running on the VM was available,
+it showed only **9 services are actually reachable from outside**:
+
+| External path | Service | Real nginx.conf rewrite |
+|---|---|---|
+| `/` | `bridge` | none (`proxy_pass` had no URI — full path passthrough) |
+| `/controlopsv2/api/` | `bridge-cp-conductor` | strip prefix entirely |
+| `/organization/wfm/api/` | `wfm-api-gateway` | strip prefix entirely |
+| `/galaxy/slmapi/` | `mcp-client` | strip prefix entirely |
+| `/prism-ui` | `prism-ui` | strip prefix, replace with `/` |
+| `/prism/api` | `prism-backend` | strip prefix, replace with `/` |
+| `/prism-scanner` | `prism-scanner` | strip prefix, replace with `/` |
+| `/acl_server/api` | `acl-server` | strip prefix, replace with `/api` |
+| `/scheduler-agent/api` | `scheduler-agent` | strip prefix, replace with `/api` |
+
+Every other service (`controlops-server`, `erep-server`,
+`qraie-api-gateway`, `qraie-ui`, `admin-panel`, `wfm-ui`, `tranops-ui`,
+`tranops-backend`, all five `iot-broker-*`, `enrollment-api`, `voxflow`,
+`radicale`) has **no Ingress at all** now — they were never actually in the
+real routing, only reachable internally via Service DNS (several of them
+reference each other that way already, e.g. `scheduler-agent`'s
+`RADICALE_BASE_URL: http://radicale:5232`).
+
+**Why one Ingress object per exposed service, not one shared Ingress:**
+`nginx.ingress.kubernetes.io/rewrite-target` is set at the Ingress *object*
+level, not per path rule — since these 9 services need three different
+rewrite behaviors (none, strip-to-`/`, strip-to-`/api`), they can't share one
+Ingress and still rewrite correctly per path. `templates/ingress.yaml`
+renders one Ingress per exposed service instead; each with the annotation
+its own `services[].ingress.rewriteTarget` needs. The regex path
+(`<prefix>(/|$)(.*)`) and `rewrite-target: <target>/$2` pairing exactly
+reproduces nginx's own prefix-matching + `proxy_pass` URI-substitution
+behavior — see the per-service comments in `values.yaml` for the specific
+`location`/`proxy_pass` line each one was derived from.
+
+**TLS and security headers** (`global.tls.*`, `global.securityHeaders`)
+reproduce the source `nginx.conf`'s HTTPS server block: the same
+`add_header` lines (via `more_set_headers` in an ingress-nginx
+`configuration-snippet`, since `headers-more` ships built into ingress-nginx)
+and TLS termination against a Secret instead of a cert file on disk. The
+HTTP→HTTPS redirect and Let's Encrypt ACME-challenge handling from the
+source config aren't reproduced here on purpose: ingress-nginx redirects to
+HTTPS automatically once a `tls:` block is present (no extra config needed),
+and cert issuance/renewal is cert-manager's job in Kubernetes — it manages
+its own challenge routing, so there's no `.well-known/acme-challenge`
+location to hand-roll. `global.tls.secretName` just needs to point at
+whatever Secret cert-manager (or you, manually) produces.
 
 **`scheduler-agent`'s `PRISM_BASE_URL`** pointed at `http://event-manager:4000`
 in the source compose file, but no `event-manager` service exists anywhere
@@ -86,7 +129,7 @@ Vault the same way before any real deployment.
   replicas: 1
   useCommonEnv: true          # false = don't merge global.commonEnv in
   env: {}                     # service-specific, overrides commonEnv on conflicts
-  ingress: { enabled: bool, path: string, pathType: Prefix }
+  ingress: { enabled: bool, path: string, rewriteTarget: string }   # rewriteTarget "" = no rewrite, passthrough
   vault: { enabled: bool }    # Vault Agent Injector, uses global.vault.role
   persistentVolumeMounts:     # references persistence.<key> PVCs (chart-level, shared across services if reused)
     - { name: <persistence key>, mountPath: string, subPath: "" }
@@ -107,6 +150,9 @@ values file overriding at minimum:
 global:
   tenantId: <tenant-id>
   domain: <tenant-id>.your-domain.com
+  tls:
+    enabled: true
+    secretName: <tenant-id>-tls   # e.g. produced by a cert-manager Certificate
 ```
 
 ## Verify

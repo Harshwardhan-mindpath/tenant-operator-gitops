@@ -8,13 +8,30 @@
 global:
   # Was `tenant.id`/`TENANT_ID` throughout the compose file.
   tenantId: PROTOTYPE
-  # Was VIRTUAL_HOST (every service in the compose file shares this one
-  # host) -- becomes the single Ingress's host, path-routed per service
-  # below via each service's `ingress.path` (was VIRTUAL_PATH).
+  # Was VIRTUAL_HOST -- becomes the host on every one of this chart's
+  # Ingress objects (one per externally-exposed service, see the "Ingress
+  # routing" section of README.md for why it's one-per-service instead of
+  # one shared Ingress).
   domain: prototype-bridgestg.qraie.ai
   ingressClassName: nginx
   ingressAnnotations: {}
   imagePullSecrets: []
+
+  # TLS termination. The source nginx.conf terminated TLS itself from a
+  # cert file on disk (/etc/nginx/certs/qraie.ai.crt) with a hand-rolled
+  # Let's Encrypt ACME-challenge location for renewal -- the Kubernetes
+  # equivalent is a TLS Secret (created by cert-manager, or manually) that
+  # ingress-nginx terminates against; cert-manager owns the ACME challenge
+  # routing itself, nothing to replicate here. Leave `enabled: false` to
+  # serve plain HTTP (e.g. behind an external TLS-terminating LB instead).
+  tls:
+    enabled: false
+    secretName: ""
+
+  # Reproduces the source nginx.conf's `add_header` lines exactly (see
+  # README.md). Applied identically to every exposed service's Ingress via
+  # a configuration-snippet annotation.
+  securityHeaders: true
 
   # Was the `x-common-env-variables` YAML anchor, merged into every service
   # that had `<<: *common-env-variables` in its `environment:` block --
@@ -119,9 +136,12 @@ services:
     image: { repository: iad.ocir.io/hbssoc/bridge-cp-conductor, tag: prototype }
     port: 8461
     useCommonEnv: false
+    # Per nginx.conf: `location /controlopsv2/api/ { proxy_pass http://prototype_controlops_v2/; }`
+    # -- trailing slash on both sides strips the matched prefix entirely.
     ingress:
       enabled: true
       path: /controlopsv2/api/
+      rewriteTarget: "/"
     vault:
       enabled: true
     env:
@@ -154,18 +174,18 @@ services:
   - name: bridge
     image: { repository: iad.ocir.io/hbssoc/acetaxi-bridge, tag: prototype }
     port: 30170
+    # Confirmed by the real nginx.conf's `location / { proxy_pass
+    # http://prototype_bridge; }` -- no URI in proxy_pass means the request
+    # is forwarded completely unrewritten. This resolves what was previously
+    # an unverifiable guess: the compose file's VIRTUAL_PATH/VIRTUAL_HOST env
+    # vars alone made `bridge`, `iot-broker-web`, and `radicale` all look
+    # like they wanted "/" -- nginx.conf shows only `bridge` is actually
+    # wired to it; the other two were never in the real routing at all (see
+    # README.md "Ingress routing").
     ingress:
       enabled: true
       path: /
-      # NOTE: `iot-broker-web` and `radicale` below also implicitly claim
-      # "/" for this same host -- the source compose file has THREE
-      # services all wanting the Ingress default path. See README.md, this
-      # needs your decision before going live; only one of these three
-      # `ingress.path: /` entries should stay "/" and it should probably be
-      # `pathType: ImplementationSpecific` with the others' explicit paths
-      # taking priority (nginx-ingress does path-length-based precedence,
-      # but relying on that implicitly is exactly what bit the original
-      # nginx-proxy setup too).
+      rewriteTarget: ""   # no rewrite -- full original path passed through
     vault:
       enabled: true
     env:
@@ -178,9 +198,8 @@ services:
     image: { repository: iad.ocir.io/hbssoc/controlops_server, tag: prototype }
     port: 30172
     useCommonEnv: false
-    ingress:
-      enabled: true
-      path: /controlops/api/
+    # NOT in the real nginx.conf (only VIRTUAL_PATH env vars suggested this
+    # was externally routed) -- internal-only, no Ingress. See README.md.
     env:
       REDIS_HOST: qraie-redis   # was container name "qraie-redis-prototype"
       REDIS_PORT: "6379"
@@ -199,9 +218,7 @@ services:
   - name: erep-server
     image: { repository: iad.ocir.io/hbssoc/erep-server, tag: stg }
     port: 30174
-    ingress:
-      enabled: true
-      path: /galaxy/erepapi/
+    # NOT in the real nginx.conf -- internal-only, no Ingress. See README.md.
     env:
       NODE_ENV: production
       BASE_URL: https://qraie_ai-b.qryde.net
@@ -224,9 +241,7 @@ services:
   - name: qraie-api-gateway
     image: { repository: iad.ocir.io/hbssoc/qraie-api-gateway-v4-stg, tag: prototype }
     port: 30176
-    ingress:
-      enabled: true
-      path: /workplace/api/
+    # NOT in the real nginx.conf -- internal-only, no Ingress. See README.md.
     env:
     # was three separate bind mounts (./attachments/, ./attachment/,
     # ./Jira_Revamp_MicroSevice/uploads/) -- consolidated onto one shared
@@ -260,16 +275,12 @@ services:
   - name: qraie-ui
     image: { repository: iad.ocir.io/hbssoc/qraie-ui-hbss-v4-stg, tag: prototype }
     port: 30180
-    ingress:
-      enabled: true
-      path: /workplace/
+    # NOT in the real nginx.conf -- internal-only, no Ingress. See README.md.
 
   - name: admin-panel
     image: { repository: iad.ocir.io/hbssoc/qraie-admin-panel, tag: bridge }
     port: 30182
-    ingress:
-      enabled: true
-      path: /workplace/admin-portal/
+    # NOT in the real nginx.conf -- internal-only, no Ingress. See README.md.
     env:
       NODE_ENV: development
       NEXT_PUBLIC_VERSION: "1.0.1"
@@ -278,9 +289,13 @@ services:
   - name: wfm-api-gateway
     image: { repository: iad.ocir.io/hbssoc/fabreq_gateway, tag: prototype }
     port: 30184
+    # Per nginx.conf: `location /organization/wfm/api/ { proxy_pass
+    # http://prototype_wfm_api_gateway/; }` -- trailing slash both sides,
+    # strips the matched prefix entirely.
     ingress:
       enabled: true
       path: /organization/wfm/api/
+      rewriteTarget: "/"
     env:
       SERVER_PORT: "30184"
       SERVER_HOST: "0.0.0.0"
@@ -294,9 +309,7 @@ services:
   - name: wfm-ui
     image: { repository: iad.ocir.io/hbssoc/wfm-ui, tag: prototype }
     port: 30188
-    ingress:
-      enabled: true
-      path: /organization/wfm/
+    # NOT in the real nginx.conf -- internal-only, no Ingress. See README.md.
     env:
       SERVER_HOST: "0.0.0.0"
       NODE_ENV: development
@@ -334,9 +347,13 @@ services:
   - name: mcp-client
     image: { repository: iad.ocir.io/hbssoc/mcp_client, tag: prototype }
     port: 30192
+    # Per nginx.conf: `location /galaxy/slmapi/ { proxy_pass
+    # http://prototype_mcp_client/; }` -- trailing slash both sides, strips
+    # the matched prefix entirely.
     ingress:
       enabled: true
       path: /galaxy/slmapi/
+      rewriteTarget: "/"
     env:
       MCP_SERVER_URL: "http://mcp-server:10011/mcp"
       CONF_URL: "https://qraie_ai-b.qryde.net/config/dbconnstr"
@@ -346,9 +363,7 @@ services:
   - name: tranops-ui
     image: { repository: iad.ocir.io/hbssoc/tranops-ui, tag: prototype }
     port: 30194
-    ingress:
-      enabled: true
-      path: /tranops
+    # NOT in the real nginx.conf -- internal-only, no Ingress. See README.md.
     env:
       BASE_URL: /tranops
       VITE_API_URL: "https://prototype-bridgestg.qraie.ai/tranops/api"
@@ -357,9 +372,7 @@ services:
   - name: tranops-backend
     image: { repository: iad.ocir.io/hbssoc/tranops-backend, tag: prototype }
     port: 30196
-    ingress:
-      enabled: true
-      path: /tranops/api
+    # NOT in the real nginx.conf -- internal-only, no Ingress. See README.md.
     env:
       SLM_API_URL: https://slm-kb.qraie.ai
       SLM_USERNAME: bridgeUser
@@ -381,9 +394,7 @@ services:
     image: { repository: iad.ocir.io/hbssoc/iot-broker-data-service, tag: stg }
     port: 3001
     useCommonEnv: false
-    ingress:
-      enabled: true
-      path: /iot-broker/api/data/
+    # NOT in the real nginx.conf -- internal-only, no Ingress. See README.md.
     env:
       NODE_ENV: production
       PORT: "3001"
@@ -401,9 +412,7 @@ services:
     image: { repository: iad.ocir.io/hbssoc/iot-broker-config-service, tag: stg }
     port: 3002
     useCommonEnv: false
-    ingress:
-      enabled: true
-      path: /iot-broker/api/config/
+    # NOT in the real nginx.conf -- internal-only, no Ingress. See README.md.
     env:
       NODE_ENV: production
       PORT: "3002"
@@ -413,9 +422,7 @@ services:
     image: { repository: iad.ocir.io/hbssoc/iot-broker-broker-service, tag: stg }
     port: 3003
     useCommonEnv: false
-    ingress:
-      enabled: true
-      path: /iot-broker/
+    # NOT in the real nginx.conf -- internal-only, no Ingress. See README.md.
     env:
       NODE_ENV: production
       PORT: "3003"
@@ -430,9 +437,7 @@ services:
     image: { repository: iad.ocir.io/hbssoc/iot-broker-admin-panel, tag: stg }
     port: 80
     useCommonEnv: false
-    ingress:
-      enabled: true
-      path: /iot-broker/admin/
+    # NOT in the real nginx.conf -- internal-only, no Ingress. See README.md.
     env:
       FRONTEND_URL: "https://prototype-bridgestg.qraie.ai"
       BASE_URL: "https://prototype-bridgestg.qraie.ai"
@@ -442,9 +447,10 @@ services:
     image: { repository: iad.ocir.io/hbssoc/iot-broker-web-portal, tag: stg }
     port: 80
     useCommonEnv: false
-    ingress:
-      enabled: true
-      path: /   # see the "/" conflict note on the `bridge` service above
+    # NOT in the real nginx.conf -- confirmed by nginx.conf's upstream list,
+    # which has no entry for this service at all; the compose file's own
+    # VIRTUAL_HOST/no-VIRTUAL_PATH combination was misleading (see the
+    # `bridge` service above, the real owner of "/"). No Ingress.
     env:
       FRONTEND_URL: "https://prototype-bridgestg.qraie.ai"
       BASE_URL: "https://prototype-bridgestg.qraie.ai"
@@ -459,9 +465,7 @@ services:
     image: { repository: iad.ocir.io/hbssoc/iot-broker-loconav-vision-gateway, tag: stg }
     port: 3040
     useCommonEnv: false
-    ingress:
-      enabled: true
-      path: /vision
+    # NOT in the real nginx.conf -- internal-only, no Ingress. See README.md.
     env:
       NODE_ENV: production
       PORT: "3040"
@@ -472,9 +476,7 @@ services:
     image: { repository: iad.ocir.io/hbssoc/iot-vlm, tag: stg }
     port: 3003
     useCommonEnv: false
-    ingress:
-      enabled: true
-      path: /enrollment/
+    # NOT in the real nginx.conf -- internal-only, no Ingress. See README.md.
     env:
       SML_BASE_URL: https://qraie-demo.qryde.net
       REDIS_URL: "redis://qraie-redis:6379"
@@ -492,18 +494,27 @@ services:
   - name: acl-server
     image: { repository: iad.ocir.io/hbssoc/acl-server, tag: stg }
     port: 28077
+    # Per nginx.conf: `location /acl_server/api { proxy_pass
+    # http://prototype_acl_server/api; }` -- no trailing slash on the
+    # location, and the proxy_pass URI is "/api" -- the matched prefix
+    # ("/acl_server/api") is replaced with "/api", not stripped to "/".
     ingress:
       enabled: true
       path: /acl_server/api
+      rewriteTarget: "/api"
     env:
       PORT: "28077"
 
   - name: prism-ui
     image: { repository: iad.ocir.io/hbssoc/prism-ui, tag: stg }
     port: 28080
+    # Per nginx.conf: `location /prism-ui { proxy_pass
+    # http://prototype_prism_ui/; }` -- no trailing slash on the location,
+    # bare "/" proxy_pass URI -- matched prefix replaced with "/".
     ingress:
       enabled: true
       path: /prism-ui
+      rewriteTarget: "/"
     env:
       PORT: "28080"
       VITE_API_URL: "https://prototype-bridgestg.qraie.ai/prism/api"
@@ -511,9 +522,13 @@ services:
   - name: prism-backend
     image: { repository: iad.ocir.io/hbssoc/prism-backend, tag: stg }
     port: 28078
+    # Per nginx.conf: `location /prism/api { proxy_pass
+    # http://prototype_prism_backend/; }` -- same "strip prefix, replace
+    # with /" pattern as prism-ui above.
     ingress:
       enabled: true
       path: /prism/api
+      rewriteTarget: "/"
     vault:
       enabled: true
     env:
@@ -526,9 +541,12 @@ services:
   - name: prism-scanner
     image: { repository: iad.ocir.io/hbssoc/prism-scanner, tag: stg }
     port: 28079
+    # Per nginx.conf: `location /prism-scanner { proxy_pass
+    # http://prototype_prism_scanner/; }` -- same pattern again.
     ingress:
       enabled: true
       path: /prism-scanner
+      rewriteTarget: "/"
     env:
       PORT: "28079"
       VITE_API_URL: "https://prototype-bridgestg.qraie.ai/prism/api"
@@ -536,9 +554,7 @@ services:
   - name: voxflow
     image: { repository: iad.ocir.io/hbssoc/voxflow, tag: stg }
     port: 30524
-    ingress:
-      enabled: true
-      path: /voxflow
+    # NOT in the real nginx.conf -- internal-only, no Ingress. See README.md.
     vault:
       enabled: true
     env:
@@ -557,9 +573,13 @@ services:
   - name: scheduler-agent
     image: { repository: iad.ocir.io/hbssoc/schedular-agent, tag: stg }
     port: 4200
+    # Per nginx.conf: `location /scheduler-agent/api { proxy_pass
+    # http://prototype_scheduler_agent/api; }` -- same "strip prefix,
+    # replace with /api" pattern as acl-server above.
     ingress:
       enabled: true
       path: /scheduler-agent/api
+      rewriteTarget: "/api"
     vault:
       enabled: true
     env:
@@ -590,10 +610,8 @@ services:
     image: { repository: tomsquest/docker-radicale, tag: 3.3.3.0 }
     port: 5232
     useCommonEnv: false
-    ingress:
-      enabled: true
-      path: /   # see the "/" conflict note on the `bridge` service above --
-                # this is the THIRD service implicitly claiming the root path
+    # NOT in the real nginx.conf (only reached internally, by
+    # scheduler-agent's RADICALE_BASE_URL) -- no Ingress. See README.md.
     vault:
       enabled: true
     env:

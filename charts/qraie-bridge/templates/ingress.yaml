@@ -1,37 +1,74 @@
+{{/*
+One Ingress object PER externally-exposed service, not one shared Ingress
+with many path rules. This is deliberate: ingress-nginx's rewrite-target
+annotation applies to the whole Ingress object, not per-path -- since these
+9 services need different rewrite targets ("/", "/api", or none at all),
+they can't share a single Ingress and still get correct per-path rewriting.
+See README.md "Ingress routing" for the full mapping back to nginx.conf's
+`location`/`proxy_pass` blocks this was converted from.
+*/}}
 {{- $root := . }}
-{{- $hasIngress := false }}
-{{- range .Values.services }}
-{{- if and (not (eq .enabled false)) (default (dict) .ingress).enabled }}
-{{- $hasIngress = true }}
-{{- end }}
-{{- end }}
-{{- if $hasIngress }}
+{{- range $svc := .Values.services }}
+{{- if and (not (eq $svc.enabled false)) (default (dict) $svc.ingress).enabled }}
+---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: {{ include "qraie-bridge.fullname" . }}
-  namespace: {{ .Release.Namespace }}
+  name: {{ include "qraie-bridge.fullname" $root }}-{{ $svc.name }}
+  namespace: {{ $root.Release.Namespace }}
   labels:
-    {{- include "qraie-bridge.labels" . | nindent 4 }}
-  {{- with .Values.global.ingressAnnotations }}
+    {{- include "qraie-bridge.labels" $root | nindent 4 }}
   annotations:
+    {{- if $svc.ingress.rewriteTarget }}
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    # $2 is the path captured after the matched prefix (see the path regex
+    # below) -- rewriteTarget in values.yaml is just the semantic "replace
+    # the matched prefix with this", the $2 suffix has to be appended here
+    # to actually carry the rest of the request path through, exactly like
+    # nginx.conf's proxy_pass did.
+    nginx.ingress.kubernetes.io/rewrite-target: {{ printf "%s/$2" ($svc.ingress.rewriteTarget | trimSuffix "/") | quote }}
+    {{- end }}
+    {{- if $root.Values.global.securityHeaders }}
+    # Reproduces nginx.conf's `add_header` lines exactly.
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      more_set_headers "X-Content-Type-Options: nosniff";
+      more_set_headers "X-Frame-Options: SAMEORIGIN";
+      more_set_headers "Content-Security-Policy: frame-ancestors 'self'";
+      more_set_headers "Strict-Transport-Security: max-age=31536000; includeSubDomains";
+      more_set_headers "Permissions-Policy: geolocation=(self)";
+      more_set_headers "Referrer-Policy: no-referrer";
+    {{- end }}
+    {{- with $root.Values.global.ingressAnnotations }}
     {{- toYaml . | nindent 4 }}
-  {{- end }}
+    {{- end }}
 spec:
-  ingressClassName: {{ .Values.global.ingressClassName }}
+  ingressClassName: {{ $root.Values.global.ingressClassName }}
+  {{- if $root.Values.global.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ $root.Values.global.domain }}
+      secretName: {{ $root.Values.global.tls.secretName }}
+  {{- end }}
   rules:
-    - host: {{ .Values.global.domain }}
+    - host: {{ $root.Values.global.domain }}
       http:
         paths:
-          {{- range $svc := .Values.services }}
-          {{- if and (not (eq $svc.enabled false)) (default (dict) $svc.ingress).enabled }}
+          {{- if $svc.ingress.rewriteTarget }}
+          # Matches the path with or without a trailing slash and captures
+          # everything after it as $2 -- the piece rewriteTarget above
+          # substitutes in. Mirrors nginx.conf's location-prefix matching
+          # (trailing-slash vs no-trailing-slash locations behave the same
+          # way once expressed as this capture-group pattern).
+          - path: {{ $svc.ingress.path | trimSuffix "/" }}(/|$)(.*)
+            pathType: ImplementationSpecific
+          {{- else }}
           - path: {{ $svc.ingress.path }}
-            pathType: {{ default "Prefix" $svc.ingress.pathType }}
+            pathType: Prefix
+          {{- end }}
             backend:
               service:
                 name: {{ $svc.name }}
                 port:
                   number: {{ $svc.port }}
-          {{- end }}
-          {{- end }}
+{{- end }}
 {{- end }}
